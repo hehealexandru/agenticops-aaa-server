@@ -1,0 +1,48 @@
+#!/bin/bash
+set -euo pipefail
+
+RADDB=/etc/freeradius/3.0
+DATA=/data
+
+die() { echo "aaa-server: $*" >&2; exit 1; }
+
+[ -n "${AAA_RADIUS_KEY:-}" ] || die "AAA_RADIUS_KEY is not set (use the same value as in the AgenticOps .env)"
+[ "${#AAA_RADIUS_KEY}" -ge 16 ] || die "AAA_RADIUS_KEY must be at least 16 characters"
+[[ "$AAA_RADIUS_KEY" =~ ^[^[:space:]\"\\]+$ ]] || die "AAA_RADIUS_KEY must not contain spaces, quotes or backslashes"
+
+mkdir -p "$DATA/users.d" "$DATA/radacct" "$DATA/log"
+chmod 700 "$DATA/users.d"
+chown freerad:freerad "$DATA/radacct" "$DATA/log"
+
+{
+    printf 'client localhost {\n\tipaddr = 127.0.0.1\n\tsecret = "%s"\n\tshortname = localhost\n\trequire_message_authenticator = yes\n}\n\n' "$AAA_RADIUS_KEY"
+    i=0
+    IFS=',' read -ra nets <<< "$RADIUS_CLIENTS"
+    for net in "${nets[@]}"; do
+        net="${net//[[:space:]]/}"
+        [ -n "$net" ] || continue
+        [[ "$net" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] || die "invalid entry in RADIUS_CLIENTS: $net"
+        i=$((i + 1))
+        printf 'client nas%d {\n\tipaddr = %s\n\tsecret = "%s"\n\tshortname = nas%d\n\tnas_type = cisco\n}\n\n' "$i" "$net" "$AAA_RADIUS_KEY" "$i"
+    done
+} > "$RADDB/clients.conf"
+chown root:freerad "$RADDB/clients.conf"
+chmod 640 "$RADDB/clients.conf"
+
+rm -rf /var/log/freeradius/radacct
+ln -s "$DATA/radacct" /var/log/freeradius/radacct
+
+radius-user rebuild --no-restart
+freeradius -C >/dev/null 2>&1 || { freeradius -XC 2>&1 | tail -20; die "FreeRADIUS configuration check failed"; }
+freeradius -l "$DATA/log/radius.log"
+
+echo "AgenticOps AAA server: FreeRADIUS running on UDP 1812/1813"
+echo "Allowed clients: $RADIUS_CLIENTS"
+profiles="$(radius-user list --names | tr '\n' ' ')"
+echo "Profiles: ${profiles:-(none)}"
+echo "Manage profiles with: radius-user help"
+
+if [ -t 0 ]; then
+    exec /bin/bash -l
+fi
+exec tail -F "$DATA/log/radius.log"
