@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/hehealexandru/agenticops_network_config_ai_agent/main/agenticops_white.png" alt="AgenticOps Logo" width="2500">
-</p>
-
 <h1 align="center">AgenticOps AAA Server – FreeRADIUS for GNS3 Labs</h1>
 
 <p align="center">
