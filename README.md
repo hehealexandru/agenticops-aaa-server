@@ -11,11 +11,6 @@
   <img src="https://img.shields.io/badge/AgenticOps-Compatible-purple" alt="AgenticOps">
 </p>
 
-A FreeRADIUS server packaged as a Docker image for GNS3 labs, built to work with
-[AgenticOps](https://github.com/hehealexandru/agenticops_network_config_ai_agent). Cisco routers
-(c3725, c7200) authenticate SSH logins against it; the network administrator and the AgenticOps
-agent each get their own profile.
-
 ## Features
 
 - **Ready for GNS3** — runs as a Docker node; the console gives you a shell while FreeRADIUS runs in the background
