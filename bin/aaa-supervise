@@ -1,0 +1,144 @@
+#!/bin/bash
+# Supervise one AAA service in the foreground and restart it when it exits.
+#
+#   aaa-supervise <service>
+#
+# Signals:
+#   HUP   intentional restart (not counted as a failure)
+#   TERM  stop the service and exit
+#
+# If the service exits unexpectedly more than AAA_MAX_RESTARTS times within
+# AAA_RESTART_WINDOW seconds, the supervisor writes a failure report to
+# /data/log, marks the service as failed in /data/state and asks the main
+# process to stop the container. The next start enters maintenance mode.
+set -uo pipefail
+
+# shellcheck source=lib/aaa-common.sh
+. /usr/local/lib/aaa/aaa-common.sh
+
+service="${1:-}"
+case "$service" in
+    radius) cmd=(freeradius -f -l "$RADIUS_LOG"); label="FreeRADIUS" ;;
+    *) echo "usage: aaa-supervise radius" >&2; exit 2 ;;
+esac
+
+max_restarts="${AAA_MAX_RESTARTS:-5}"
+window="${AAA_RESTART_WINDOW:-60}"
+
+child=""
+stopping=0
+restart_requested=0
+crashes=()          # epoch seconds of recent unexpected exits
+
+trap 'stopping=1' TERM
+trap 'restart_requested=1' HUP
+trap ':' INT        # handled by the main process; children get the default
+
+mkdir -p "$RUN_DIR"
+echo $$ > "$(supervise_pid_file "$service")"
+
+start_child() {
+    "${cmd[@]}" &
+    child=$!
+    state_set "$service" running "$child" "${#crashes[@]}"
+    aaa_log "$label started (pid $child)"
+}
+
+stop_child() {
+    kill -TERM "$child" 2>/dev/null || return 0
+    for _ in $(seq 50); do
+        kill -0 "$child" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+}
+
+finish() {
+    state_set "$service" stopped "" "${#crashes[@]}"
+    rm -f "$(supervise_pid_file "$service")"
+    exit "$1"
+}
+
+prune_crashes() {
+    local now t kept=()
+    now="$(date +%s)"
+    for t in "${crashes[@]}"; do
+        [ $((now - t)) -lt "$window" ] && kept+=("$t")
+    done
+    crashes=("${kept[@]}")
+}
+
+# Interruptible sleep: returns early when a signal sets a flag.
+pause() {
+    sleep "$1" &
+    local sp=$!
+    wait "$sp" 2>/dev/null
+    kill "$sp" 2>/dev/null || true
+}
+
+give_up() {
+    local rc="$1" report main
+    state_set "$service" failed "" "${#crashes[@]}"
+    report="$(write_failure_report "$service" \
+        "$label exited unexpectedly $((max_restarts + 1)) times within ${window}s (last exit status $rc)")"
+    aaa_log "$label keeps failing: giving up and stopping the container"
+    aaa_log "failure report: $report"
+    aaa_log "on the next start the server stays in maintenance mode until: radius-user start"
+    rm -f "$(supervise_pid_file "$service")"
+    if main="$(main_pid)"; then
+        kill -USR2 "$main"
+    fi
+    exit 1
+}
+
+start_child
+while :; do
+    wait "$child"
+    rc=$?
+
+    if kill -0 "$child" 2>/dev/null; then
+        # wait was interrupted by a signal; the service is still running
+        if [ "$stopping" = 1 ]; then
+            stop_child
+            aaa_log "$label stopped"
+            finish 0
+        fi
+        if [ "$restart_requested" = 1 ]; then
+            restart_requested=0
+            aaa_log "$label restart requested"
+            stop_child
+            start_child
+        fi
+        continue
+    fi
+
+    # the service has exited
+    if [ "$stopping" = 1 ]; then
+        aaa_log "$label stopped"
+        finish 0
+    fi
+    if [ "$restart_requested" = 1 ]; then
+        restart_requested=0
+        start_child
+        continue
+    fi
+
+    prune_crashes
+    if [ "${#crashes[@]}" -ge "$max_restarts" ]; then
+        give_up "$rc"
+    fi
+    crashes+=("$(date +%s)")
+    n="${#crashes[@]}"
+    delay=$((1 << (n - 1)))
+    [ "$delay" -le 8 ] || delay=8
+    aaa_log "$label exited unexpectedly (status $rc); restart $n/$max_restarts in ${delay}s"
+    state_set "$service" restarting "" "$n"
+    pause "$delay"
+    if [ "$stopping" = 1 ]; then
+        aaa_log "$label stopped"
+        finish 0
+    fi
+    restart_requested=0
+    start_child
+done

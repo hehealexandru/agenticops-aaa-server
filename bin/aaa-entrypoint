@@ -1,18 +1,34 @@
 #!/bin/bash
+# Main process of the AgenticOps AAA server container (runs under tini).
+#
+# Renders the FreeRADIUS configuration, starts the service supervisor, gives a
+# shell on the console (or follows the log without a TTY) and coordinates
+# shutdown:
+#   TERM/INT  (docker stop)          stop the services, then exit 0
+#   USR1      (radius-user start)    start FreeRADIUS after maintenance mode
+#   USR2      (supervisor gave up)   stop the services, then exit 1
 set -euo pipefail
 
-RADDB=/etc/freeradius/3.0
-DATA=/data
+# shellcheck source=lib/aaa-common.sh
+. /usr/local/lib/aaa/aaa-common.sh
 
 die() { echo "aaa-server: $*" >&2; exit 1; }
 
 [ -n "${AAA_RADIUS_KEY:-}" ] || die "AAA_RADIUS_KEY is not set (use the same value as in the AgenticOps .env)"
 [ "${#AAA_RADIUS_KEY}" -ge 16 ] || die "AAA_RADIUS_KEY must be at least 16 characters"
 [[ "$AAA_RADIUS_KEY" =~ ^[^[:space:]\"\\]+$ ]] || die "AAA_RADIUS_KEY must not contain spaces, quotes or backslashes"
+[[ "${AAA_MAX_RESTARTS:-5}" =~ ^[1-9][0-9]{0,2}$ ]] || die "AAA_MAX_RESTARTS must be an integer between 1 and 999"
+[[ "${AAA_RESTART_WINDOW:-60}" =~ ^[1-9][0-9]{0,4}$ ]] || die "AAA_RESTART_WINDOW must be a number of seconds between 1 and 99999"
 
-mkdir -p "$DATA/users.d" "$DATA/radacct" "$DATA/log"
-chmod 700 "$DATA/users.d"
-chown freerad:freerad "$DATA/radacct" "$DATA/log"
+mkdir -p "$DATA/users.d" "$DATA/radacct" "$LOG_DIR" "$STATE_DIR"
+chmod 700 "$DATA/users.d" "$STATE_DIR"
+chown freerad:freerad "$DATA/radacct" "$LOG_DIR"
+
+# Volatile runtime state; stale files from a previous run of this container are removed.
+rm -rf "$RUN_DIR"
+mkdir -p "$RUN_DIR"
+chmod 700 "$RUN_DIR"
+(umask 077; printf '%s' "$AAA_RADIUS_KEY" > "$RADIUS_SECRET_FILE")
 
 {
     printf 'client localhost {\n\tipaddr = 127.0.0.1\n\tsecret = "%s"\n\tshortname = localhost\n\trequire_message_authenticator = yes\n}\n\n' "$AAA_RADIUS_KEY"
@@ -33,16 +49,92 @@ rm -rf /var/log/freeradius/radacct
 ln -s "$DATA/radacct" /var/log/freeradius/radacct
 
 radius-user rebuild --no-restart
-freeradius -C >/dev/null 2>&1 || { freeradius -XC 2>&1 | tail -20; die "FreeRADIUS configuration check failed"; }
-freeradius -l "$DATA/log/radius.log"
+echo $$ > "$MAIN_PID_FILE"
 
-echo "AgenticOps AAA server: FreeRADIUS running on UDP 1812/1813"
+# From here on the script is a long-running coordinator: no errexit.
+set +e
+
+supervisor=""
+console=""
+shutdown_requested=0
+start_requested=0
+gave_up=0
+
+start_radius() {
+    supervisor_pid radius >/dev/null && return 0
+    aaa-supervise radius &
+    supervisor=$!
+}
+
+shutdown_all() {
+    local rc="$1" pid
+    if pid="$(supervisor_pid radius)"; then
+        kill -TERM "$pid" 2>/dev/null
+        for _ in $(seq 80); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
+    [ -z "$supervisor" ] || wait "$supervisor" 2>/dev/null
+    if [ -n "$console" ] && kill -0 "$console" 2>/dev/null; then
+        exec 2>/dev/null        # no "Hangup" job notice on the console
+        kill -HUP "$console"
+        for _ in $(seq 10); do
+            kill -0 "$console" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL "$console" 2>/dev/null
+    fi
+    rm -f "$MAIN_PID_FILE"
+    exit "$rc"
+}
+
+trap 'shutdown_requested=1' TERM
+trap 'start_requested=1' USR1
+trap 'gave_up=1' USR2
+if [ -t 0 ]; then
+    trap ':' INT                # Ctrl-C on the console belongs to the shell
+else
+    trap 'shutdown_requested=1' INT
+fi
+
+echo "AgenticOps AAA server: FreeRADIUS on UDP 1812/1813"
 echo "Allowed clients: $RADIUS_CLIENTS"
 profiles="$(radius-user list --names | tr '\n' ' ')"
 echo "Profiles: ${profiles:-(none)}"
+
+if [ -e "$(failed_marker radius)" ]; then
+    state_set radius failed "" 0
+    maintenance_banner radius
+elif ! radius_config_ok; then
+    report="$(write_failure_report radius "FreeRADIUS configuration check failed at startup")"
+    aaa_log "FreeRADIUS configuration check failed at startup, report: $report"
+    state_set radius failed "" 0
+    maintenance_banner radius
+else
+    start_radius
+    echo "FreeRADIUS is supervised: ${AAA_MAX_RESTARTS:-5} restarts within ${AAA_RESTART_WINDOW:-60}s are tolerated, then the container stops"
+fi
 echo "Manage profiles with: radius-user help"
 
 if [ -t 0 ]; then
-    exec /bin/bash -l
+    # Interactive shell as a child (not exec) so this process keeps handling signals.
+    # Bash starts background jobs with SIGINT/SIGQUIT ignored; restore them so
+    # Ctrl-C works for commands typed on the console.
+    env --default-signal=INT,QUIT bash -l <&0 &
+else
+    tail -n 0 -F "$RADIUS_LOG" "$SUPERVISOR_LOG" 2>/dev/null &
 fi
-exec tail -F "$DATA/log/radius.log"
+console=$!
+
+while :; do
+    wait "$console"
+    if [ "$shutdown_requested" = 1 ]; then shutdown_all 0; fi
+    if [ "$gave_up" = 1 ]; then shutdown_all 1; fi
+    if [ "$start_requested" = 1 ]; then
+        start_requested=0
+        start_radius
+        continue
+    fi
+    kill -0 "$console" 2>/dev/null || shutdown_all 0   # console shell exited
+done

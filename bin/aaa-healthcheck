@@ -1,0 +1,25 @@
+#!/bin/bash
+# Docker HEALTHCHECK: healthy only if FreeRADIUS answers a Status-Server
+# request on 127.0.0.1:1812. Reports the state; it does not restart anything.
+set -uo pipefail
+
+# shellcheck source=lib/aaa-common.sh
+. /usr/local/lib/aaa/aaa-common.sh
+
+if [ -e "$(failed_marker radius)" ]; then
+    echo "maintenance mode: FreeRADIUS failed, see $(sed -n 's/^report=//p' "$(failed_marker radius)")"
+    exit 1
+fi
+
+state="$(state_get radius state)"
+if [ "$state" != running ]; then
+    echo "FreeRADIUS is ${state:-not started}"
+    exit 1
+fi
+
+if radius_probe; then
+    echo "FreeRADIUS answers Status-Server on 127.0.0.1:1812"
+    exit 0
+fi
+echo "FreeRADIUS process is running but does not answer Status-Server on 127.0.0.1:1812"
+exit 1

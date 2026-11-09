@@ -1,10 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-RADDB=/etc/freeradius/3.0
-USERS_DIR=/data/users.d
+# shellcheck source=lib/aaa-common.sh
+. /usr/local/lib/aaa/aaa-common.sh
+
+USERS_DIR="$DATA/users.d"
 AUTHORIZE="$RADDB/mods-config/files/authorize"
-LOG=/data/log/radius.log
 
 die() { echo "radius-user: $*" >&2; exit 1; }
 
@@ -17,8 +18,9 @@ Usage: radius-user <command> [args]
   del <username>                 delete a profile
   list                           list profiles and roles
   test <username>                send a test Access-Request to the local server
-  status                         show whether FreeRADIUS is running and the last log lines
-  restart                        restart FreeRADIUS
+  status                         show the FreeRADIUS state, a live probe and the last log lines
+  restart                        check the configuration, then restart FreeRADIUS
+  start                          start FreeRADIUS after a failure (maintenance mode)
 
 Roles:
   admin   priv-lvl 15
@@ -62,15 +64,50 @@ write_profile() {
 
 role_of() { sed -n 's/^# role: //p' "$USERS_DIR/$1" 2>/dev/null; }
 
+# Refuse to touch the running server when the new configuration is broken.
+check_config() {
+    radius_config_ok && return 0
+    freeradius -XC 2>&1 | tail -n 20 >&2
+    die "FreeRADIUS configuration check failed; the running server was not touched"
+}
+
+# Wait until FreeRADIUS answers Status-Server with a pid different from $1.
+wait_answering() {
+    local old_pid="${1:-}" pid
+    for _ in $(seq 40); do
+        pid="$(state_get radius pid)"
+        if [ "$(state_get radius state)" = running ] && [ -n "$pid" ] && [ "$pid" != "$old_pid" ] \
+            && radius_probe; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
 restart() {
-    local pids
-    pids="$(pidof freeradius || true)"
-    if [ -n "$pids" ]; then
-        kill $pids
-        for _ in $(seq 50); do pidof freeradius >/dev/null || break; sleep 0.1; done
-    fi
-    freeradius -l "$LOG"
+    local sup old_pid
+    sup="$(supervisor_pid radius)" \
+        || die "FreeRADIUS is not running (maintenance mode?); check 'radius-user status', then use 'radius-user start'"
+    check_config
+    old_pid="$(state_get radius pid)"
+    kill -HUP "$sup"
+    wait_answering "$old_pid" || die "FreeRADIUS did not come back; see 'radius-user status'"
     echo "FreeRADIUS restarted"
+}
+
+start() {
+    local main
+    if supervisor_pid radius >/dev/null; then
+        echo "FreeRADIUS is already running (use 'radius-user restart')"
+        return 0
+    fi
+    main="$(main_pid)" || die "the AAA server main process is not running"
+    check_config
+    rm -f "$(failed_marker radius)"
+    kill -USR1 "$main"
+    wait_answering "" || die "FreeRADIUS did not start; see 'radius-user status'"
+    echo "FreeRADIUS started"
 }
 
 rebuild() {
@@ -81,7 +118,42 @@ rebuild() {
     done
     chown root:freerad "$AUTHORIZE"
     chmod 640 "$AUTHORIZE"
-    [ "${1:-}" = "--no-restart" ] || restart
+    [ "${1:-}" = "--no-restart" ] && return 0
+    if supervisor_pid radius >/dev/null; then
+        restart
+    else
+        echo "FreeRADIUS is not running: the change applies at the next 'radius-user start'" >&2
+    fi
+}
+
+status() {
+    local state pid restarts since marker
+    marker="$(failed_marker radius)"
+    state="$(state_get radius state)"
+    pid="$(state_get radius pid)"
+    restarts="$(state_get radius restarts)"
+    since="$(state_get radius since)"
+    case "${state:-unknown}" in
+        running)    echo "FreeRADIUS: running (pid $pid, since $since)" ;;
+        restarting) echo "FreeRADIUS: RESTARTING after a crash (since $since)" ;;
+        *)          echo "FreeRADIUS: NOT running (${state:-unknown}${since:+, since $since})" ;;
+    esac
+    echo "Unexpected restarts in the last ${AAA_RESTART_WINDOW:-60}s: ${restarts:-0} (limit ${AAA_MAX_RESTARTS:-5})"
+    if [ -e "$marker" ]; then
+        echo "MAINTENANCE MODE: $(sed -n 's/^reason=//p' "$marker")"
+        echo "  failed at: $(sed -n 's/^time=//p' "$marker")"
+        echo "  report:    $(sed -n 's/^report=//p' "$marker")"
+        echo "  fix the cause, then run: radius-user start"
+    fi
+    if radius_probe; then
+        echo "Status-Server probe on 127.0.0.1:1812: OK"
+    else
+        echo "Status-Server probe on 127.0.0.1:1812: NO ANSWER"
+    fi
+    echo "--- $SUPERVISOR_LOG"
+    tail -n 5 "$SUPERVISOR_LOG" 2>/dev/null || true
+    echo "--- $RADIUS_LOG"
+    tail -n 10 "$RADIUS_LOG" 2>/dev/null || true
 }
 
 cmd="${1:-help}"
@@ -125,11 +197,13 @@ case "$cmd" in
         ;;
     test)
         check_name "${1:-}"
+        [ -r "$RADIUS_SECRET_FILE" ] || die "shared secret file $RADIUS_SECRET_FILE is missing"
         read -rsp "Password: " pw; echo >&2
         pw="${pw//\\/\\\\}"
         pw="${pw//\"/\\\"}"
+        # The secret is read from a root-only file (-S), never passed on the command line.
         printf 'User-Name = "%s"\nUser-Password = "%s"\n' "$1" "$pw" \
-            | radclient -r 1 -t 3 127.0.0.1:1812 auth "$AAA_RADIUS_KEY"
+            | radclient -r 1 -t 3 -S "$RADIUS_SECRET_FILE" 127.0.0.1:1812 auth
         ;;
     rebuild)
         rebuild "${1:-}"
@@ -137,9 +211,11 @@ case "$cmd" in
     restart)
         restart
         ;;
+    start)
+        start
+        ;;
     status)
-        if pidof freeradius >/dev/null; then echo "FreeRADIUS is running (pid $(pidof freeradius))"; else echo "FreeRADIUS is NOT running"; fi
-        tail -n 15 "$LOG" 2>/dev/null || true
+        status
         ;;
     help|-h|--help)
         usage
